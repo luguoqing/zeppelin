@@ -28,6 +28,7 @@ import java.io.IOException;
 import java.text.ParseException;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
@@ -189,11 +190,12 @@ public class NotebookService {
   public void removeNote(String noteId,
                          ServiceContext context,
                          ServiceCallback<String> callback) throws IOException {
-    if (notebook.getNote(noteId) != null) {
-      if (!checkPermission(noteId, Permission.OWNER, Message.OP.DEL_NOTE, context, callback)) {
+    Note note = notebook.getNote(noteId);
+    if (note != null) {
+      if (!checkPermission(note.getId(), Permission.OWNER, Message.OP.DEL_NOTE, context, callback)) {
         return;
       }
-      notebook.removeNote(noteId, context.getAutheInfo());
+      notebook.removeNote(note, context.getAutheInfo());
       callback.onSuccess("Delete note successfully", context);
     } else {
       callback.onFailure(new NoteNotFoundException(noteId), context);
@@ -333,7 +335,7 @@ public class NotebookService {
       p.settings.setParams(params);
     }
     if (config != null && !config.isEmpty()) {
-      p.setConfig(config);
+      p.mergeConfig(config);
     }
 
     if (note.isPersonalizedMode()) {
@@ -345,7 +347,7 @@ public class NotebookService {
         p.settings.setParams(params);
       }
       if (config != null && !config.isEmpty()) {
-        p.setConfig(config);
+        p.mergeConfig(config);
       }
     }
 
@@ -391,10 +393,10 @@ public class NotebookService {
       return false;
     }
 
-    note.setRunning(true);
-    try {
-      if (paragraphs != null) {
-        // run note via the data passed from frontend
+    if (paragraphs != null) {
+      // run note via the data passed from frontend
+      try {
+        note.setRunning(true);
         for (Map<String, Object> raw : paragraphs) {
           String paragraphId = (String) raw.get("id");
           if (paragraphId == null) {
@@ -416,18 +418,18 @@ public class NotebookService {
             throw new IOException("Fail to run paragraph json: " + raw);
           }
         }
-      } else {
-        try {
-          // run note directly when parameter `paragraphs` is null.
-          note.runAll(context.getAutheInfo(), true);
-          return true;
-        } catch (Exception e) {
-          LOGGER.warn("Fail to run note: " + note.getName(), e);
-          return false;
-        }
+      } finally {
+        note.setRunning(false);
       }
-    } finally {
-      note.setRunning(false);
+    } else {
+      try {
+        // run note directly when parameter `paragraphs` is null.
+        note.runAll(context.getAutheInfo(), true, false, new HashMap<>());
+        return true;
+      } catch (Exception e) {
+        LOGGER.warn("Fail to run note: " + note.getName(), e);
+        return false;
+      }
     }
 
     return true;
@@ -603,13 +605,13 @@ public class NotebookService {
     }
 
     p.settings.setParams(params);
-    p.setConfig(config);
+    p.mergeConfig(config);
     p.setTitle(title);
     p.setText(text);
     if (note.isPersonalizedMode()) {
       p = p.getUserParagraph(context.getAutheInfo().getUser());
       p.settings.setParams(params);
-      p.setConfig(config);
+      p.mergeConfig(config);
       p.setTitle(title);
       p.setText(text);
     }

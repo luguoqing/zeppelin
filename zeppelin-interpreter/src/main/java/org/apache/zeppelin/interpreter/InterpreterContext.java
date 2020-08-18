@@ -17,6 +17,7 @@
 
 package org.apache.zeppelin.interpreter;
 
+import com.google.common.collect.Maps;
 import org.apache.zeppelin.display.AngularObjectRegistry;
 import org.apache.zeppelin.display.GUI;
 import org.apache.zeppelin.interpreter.remote.RemoteInterpreterEventClient;
@@ -122,7 +123,9 @@ public class InterpreterContext {
     }
 
     public Builder setConfig(Map<String, Object> config) {
-      context.config = config;
+      if (config != null) {
+        context.config = Maps.newHashMap(config);
+      }
       return this;
     }
 
@@ -227,6 +230,10 @@ public class InterpreterContext {
 
   public double getDoubleLocalProperty(String key, double defaultValue) {
     return Double.parseDouble(localProperties.getOrDefault(key, defaultValue + ""));
+  }
+
+  public boolean getBooleanLocalProperty(String key, boolean defaultValue) {
+    return Boolean.parseBoolean(localProperties.getOrDefault(key, defaultValue + ""));
   }
 
   public AuthenticationInfo getAuthenticationInfo() {

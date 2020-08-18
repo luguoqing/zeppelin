@@ -56,7 +56,6 @@ import org.apache.zeppelin.helium.ApplicationEventListener;
 import org.apache.zeppelin.helium.HeliumPackage;
 import org.apache.zeppelin.interpreter.InterpreterGroup;
 import org.apache.zeppelin.interpreter.InterpreterResult;
-import org.apache.zeppelin.interpreter.InterpreterResultMessage;
 import org.apache.zeppelin.interpreter.InterpreterSetting;
 import org.apache.zeppelin.interpreter.remote.RemoteAngularObjectRegistry;
 import org.apache.zeppelin.interpreter.remote.RemoteInterpreterProcessListener;
@@ -96,6 +95,8 @@ import org.eclipse.jetty.websocket.servlet.WebSocketServletFactory;
 import org.glassfish.hk2.api.ServiceLocator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import static org.apache.zeppelin.notebook.socket.Message.MSG_ID_NOT_DEFINED;
 
 /**
  * Zeppelin websocket service. This class used setter injection because all servlet should have
@@ -507,8 +508,10 @@ public class NotebookServer extends WebSocketServlet
         });
   }
 
-  public void broadcastUpdateNoteJobInfo(long lastUpdateUnixTime) throws IOException {
-    getJobManagerService().getNoteJobInfoByUnixTime(lastUpdateUnixTime, null,
+  public void broadcastUpdateNoteJobInfo(Note note, long lastUpdateUnixTime) throws IOException {
+    ServiceContext context = new ServiceContext(new AuthenticationInfo(),
+            getNotebookAuthorizationService().getOwners(note.getId()));
+    getJobManagerService().getNoteJobInfoByUnixTime(lastUpdateUnixTime, context,
         new WebSocketServiceCallback<List<JobManagerService.NoteJobInfo>>(null) {
           @Override
           public void onSuccess(List<JobManagerService.NoteJobInfo> notesJobInfo,
@@ -577,7 +580,7 @@ public class NotebookServer extends WebSocketServlet
 
   public void broadcastNote(Note note) {
     inlineBroadcastNote(note);
-    broadcastClusterEvent(ClusterEvent.BROADCAST_NOTE, note);
+    broadcastClusterEvent(ClusterEvent.BROADCAST_NOTE, MSG_ID_NOT_DEFINED, note);
   }
 
   private void inlineBroadcastNote(Note note) {
@@ -585,36 +588,38 @@ public class NotebookServer extends WebSocketServlet
     getConnectionManager().broadcast(note.getId(), message);
   }
 
-  private void inlineBroadcastParagraph(Note note, Paragraph p) {
+  private void inlineBroadcastParagraph(Note note, Paragraph p, String msgId) {
     broadcastNoteForms(note);
 
     if (note.isPersonalizedMode()) {
-      broadcastParagraphs(p.getUserParagraphMap(), p);
+      broadcastParagraphs(p.getUserParagraphMap(), p, msgId);
     } else {
-      Message message = new Message(OP.PARAGRAPH).put("paragraph", p);
+      Message message = new Message(OP.PARAGRAPH).withMsgId(msgId).put("paragraph", p);
       getConnectionManager().broadcast(note.getId(), message);
     }
   }
 
-  public void broadcastParagraph(Note note, Paragraph p) {
-    inlineBroadcastParagraph(note, p);
-    broadcastClusterEvent(ClusterEvent.BROADCAST_PARAGRAPH, note, p);
+  public void broadcastParagraph(Note note, Paragraph p, String msgId) {
+    inlineBroadcastParagraph(note, p, msgId);
+    broadcastClusterEvent(ClusterEvent.BROADCAST_PARAGRAPH, msgId, note, p);
   }
 
   private void inlineBroadcastParagraphs(Map<String, Paragraph> userParagraphMap,
-                                         Paragraph defaultParagraph) {
+                                         Paragraph defaultParagraph,
+                                         String msgId) {
     if (null != userParagraphMap) {
       for (String user : userParagraphMap.keySet()) {
-        Message message = new Message(OP.PARAGRAPH).put("paragraph", userParagraphMap.get(user));
+        Message message = new Message(OP.PARAGRAPH).withMsgId(msgId).put("paragraph", userParagraphMap.get(user));
         getConnectionManager().multicastToUser(user, message);
       }
     }
   }
 
   private void broadcastParagraphs(Map<String, Paragraph> userParagraphMap,
-                                  Paragraph defaultParagraph) {
-    inlineBroadcastParagraphs(userParagraphMap, defaultParagraph);
-    broadcastClusterEvent(ClusterEvent.BROADCAST_PARAGRAPHS, userParagraphMap, defaultParagraph);
+                                   Paragraph defaultParagraph,
+                                   String msgId) {
+    inlineBroadcastParagraphs(userParagraphMap, defaultParagraph, msgId);
+    broadcastClusterEvent(ClusterEvent.BROADCAST_PARAGRAPHS, msgId, userParagraphMap, defaultParagraph);
   }
 
   private void inlineBroadcastNewParagraph(Note note, Paragraph para) {
@@ -627,7 +632,7 @@ public class NotebookServer extends WebSocketServlet
 
   private void broadcastNewParagraph(Note note, Paragraph para) {
     inlineBroadcastNewParagraph(note, para);
-    broadcastClusterEvent(ClusterEvent.BROADCAST_NEW_PARAGRAPH, note, para);
+    broadcastClusterEvent(ClusterEvent.BROADCAST_NEW_PARAGRAPH, MSG_ID_NOT_DEFINED, note, para);
   }
 
   public void inlineBroadcastNoteList(AuthenticationInfo subject, Set<String> userAndRoles) {
@@ -646,17 +651,18 @@ public class NotebookServer extends WebSocketServlet
 
   public void broadcastNoteList(AuthenticationInfo subject, Set<String> userAndRoles) {
     inlineBroadcastNoteList(subject, userAndRoles);
-    broadcastClusterEvent(ClusterEvent.BROADCAST_NOTE_LIST, subject, userAndRoles);
+    broadcastClusterEvent(ClusterEvent.BROADCAST_NOTE_LIST, MSG_ID_NOT_DEFINED, subject, userAndRoles);
   }
 
   // broadcast ClusterEvent
-  private void broadcastClusterEvent(ClusterEvent event, Object... objects) {
+  private void broadcastClusterEvent(ClusterEvent event, String msgId, Object... objects) {
     ZeppelinConfiguration conf = ZeppelinConfiguration.create();
     if (!conf.isClusterMode()) {
       return;
     }
 
     ClusterMessage clusterMessage = new ClusterMessage(event);
+    clusterMessage.setMsgId(msgId);
 
     for(Object object : objects) {
       String json = "";
@@ -738,10 +744,10 @@ public class NotebookServer extends WebSocketServlet
         }
         break;
       case BROADCAST_PARAGRAPH:
-        inlineBroadcastParagraph(note, paragraph);
+        inlineBroadcastParagraph(note, paragraph, message.getMsgId());
         break;
       case BROADCAST_PARAGRAPHS:
-        inlineBroadcastParagraphs(userParagraphMap, paragraph);
+        inlineBroadcastParagraphs(userParagraphMap, paragraph, message.getMsgId());
         break;
       case BROADCAST_NEW_PARAGRAPH:
         inlineBroadcastNewParagraph(note, paragraph);
@@ -1112,9 +1118,9 @@ public class NotebookServer extends WebSocketServlet
             if (p.getNote().isPersonalizedMode()) {
               Map<String, Paragraph> userParagraphMap =
                   p.getNote().getParagraph(paragraphId).getUserParagraphMap();
-              broadcastParagraphs(userParagraphMap, p);
+              broadcastParagraphs(userParagraphMap, p, fromMessage.msgId);
             } else {
-              broadcastParagraph(p.getNote(), p);
+              broadcastParagraph(p.getNote(), p, fromMessage.msgId);
             }
           }
         });
@@ -1252,9 +1258,9 @@ public class NotebookServer extends WebSocketServlet
           public void onSuccess(Paragraph p, ServiceContext context) throws IOException {
             super.onSuccess(p, context);
             if (p.getNote().isPersonalizedMode()) {
-              getConnectionManager().unicastParagraph(p.getNote(), p, context.getAutheInfo().getUser());
+              getConnectionManager().unicastParagraph(p.getNote(), p, context.getAutheInfo().getUser(), fromMessage.msgId);
             } else {
-              broadcastParagraph(p.getNote(), p);
+              broadcastParagraph(p.getNote(), p, fromMessage.msgId);
             }
           }
         });
@@ -1371,7 +1377,7 @@ public class NotebookServer extends WebSocketServlet
           interpreterGroup.getAngularObjectRegistry();
       AngularObject ao = removeAngularFromRemoteRegistry(noteId, paragraphId, varName, registry,
           interpreterGroup.getId(), conn);
-      note.deleteAngularObject(interpreterGroup.getId(), ao);
+      note.deleteAngularObject(interpreterGroup.getId(), noteId, paragraphId, varName);
     }
   }
 
@@ -1519,7 +1525,7 @@ public class NotebookServer extends WebSocketServlet
             if (p.getNote().isPersonalizedMode()) {
               Paragraph p2 = p.getNote().clearPersonalizedParagraphOutput(paragraphId,
                   context.getAutheInfo().getUser());
-              getConnectionManager().unicastParagraph(p.getNote(), p2, context.getAutheInfo().getUser());
+              getConnectionManager().unicastParagraph(p.getNote(), p2, context.getAutheInfo().getUser(), fromMessage.msgId);
             }
 
             // if it's the last paragraph and not empty, let's add a new one
@@ -1697,7 +1703,7 @@ public class NotebookServer extends WebSocketServlet
       } else {
         note.clearParagraphOutput(paragraphId);
         Paragraph paragraph = note.getParagraph(paragraphId);
-        broadcastParagraph(note, paragraph);
+        broadcastParagraph(note, paragraph, MSG_ID_NOT_DEFINED);
       }
     } catch (IOException e) {
       LOG.warn("Fail to call onOutputClear", e);
@@ -1800,7 +1806,9 @@ public class NotebookServer extends WebSocketServlet
   @Override
   public void onParagraphRemove(Paragraph p) {
     try {
-      getJobManagerService().getNoteJobInfoByUnixTime(System.currentTimeMillis() - 5000, null,
+      ServiceContext context = new ServiceContext(new AuthenticationInfo(),
+              getNotebookAuthorizationService().getOwners(p.getNote().getId()));
+      getJobManagerService().getNoteJobInfoByUnixTime(System.currentTimeMillis() - 5000, context,
           new JobManagerServiceCallback());
     } catch (IOException e) {
       LOG.warn("can not broadcast for job manager: " + e.getMessage(), e);
@@ -1810,7 +1818,7 @@ public class NotebookServer extends WebSocketServlet
   @Override
   public void onNoteRemove(Note note, AuthenticationInfo subject) {
     try {
-      broadcastUpdateNoteJobInfo(System.currentTimeMillis() - 5000);
+      broadcastUpdateNoteJobInfo(note, System.currentTimeMillis() - 5000);
     } catch (IOException e) {
       LOG.warn("can not broadcast for job manager: " + e.getMessage(), e);
     }
@@ -1917,9 +1925,9 @@ public class NotebookServer extends WebSocketServlet
     }
 
     p.setStatusToUserParagraph(p.getStatus());
-    broadcastParagraph(p.getNote(), p);
+    broadcastParagraph(p.getNote(), p, MSG_ID_NOT_DEFINED);
     try {
-      broadcastUpdateNoteJobInfo(System.currentTimeMillis() - 5000);
+      broadcastUpdateNoteJobInfo(p.getNote(), System.currentTimeMillis() - 5000);
     } catch (IOException e) {
       LOG.error("can not broadcast for job manager {}", e);
     }
@@ -1970,53 +1978,80 @@ public class NotebookServer extends WebSocketServlet
   }
 
   @Override
-  public void onAdd(String interpreterGroupId, AngularObject object) {
-    onUpdate(interpreterGroupId, object);
+  public void onAddAngularObject(String interpreterGroupId, AngularObject angularObject) {
+    onUpdateAngularObject(interpreterGroupId, angularObject);
   }
 
   @Override
-  public void onUpdate(String interpreterGroupId, AngularObject object) {
+  public void onUpdateAngularObject(String interpreterGroupId, AngularObject angularObject) {
     if (getNotebook() == null) {
       return;
     }
 
-    List<Note> notes = getNotebook().getAllNotes();
-    for (Note note : notes) {
-      if (object.getNoteId() != null && !note.getId().equals(object.getNoteId())) {
-        continue;
+    // not global scope, so we just need to load the corresponded note.
+    if (angularObject.getNoteId() != null) {
+      try {
+        Note note = getNotebook().getNote(angularObject.getNoteId());
+        updateNoteAngularObject(note, angularObject, interpreterGroupId);
+      } catch (IOException e) {
+        LOG.error("AngularObject's note: {} is not found", angularObject.getNoteId());
       }
-
-      List<InterpreterSetting> intpSettings =
-              note.getBindedInterpreterSettings(
-                      new ArrayList<>(getNotebookAuthorizationService().getOwners(note.getId())));
-      if (intpSettings.isEmpty()) {
-        continue;
-      }
-
-      getConnectionManager().broadcast(note.getId(), new Message(OP.ANGULAR_OBJECT_UPDATE)
-          .put("angularObject", object)
-          .put("interpreterGroupId", interpreterGroupId).put("noteId", note.getId())
-          .put("paragraphId", object.getParagraphId()));
+    } else {
+      // global scope angular object needs to load and iterate all notes, this is inefficient.
+      getNotebook().getNoteStream().forEach(note -> {
+        if (angularObject.getNoteId() != null && !note.getId().equals(angularObject.getNoteId())) {
+          return;
+        }
+        updateNoteAngularObject(note, angularObject, interpreterGroupId);
+      });
     }
   }
 
-  @Override
-  public void onRemove(String interpreterGroupId, String name, String noteId, String paragraphId) {
-    List<Note> notes = getNotebook().getAllNotes();
-    for (Note note : notes) {
-      if (noteId != null && !note.getId().equals(noteId)) {
-        continue;
-      }
+  private void updateNoteAngularObject(Note note, AngularObject angularObject, String interpreterGroupId) {
+    List<InterpreterSetting> intpSettings =
+            note.getBindedInterpreterSettings(
+                    new ArrayList<>(getNotebookAuthorizationService().getOwners(note.getId())));
+    if (intpSettings.isEmpty()) {
+      return;
+    }
+    getConnectionManager().broadcast(note.getId(), new Message(OP.ANGULAR_OBJECT_UPDATE)
+            .put("angularObject", angularObject)
+            .put("interpreterGroupId", interpreterGroupId).put("noteId", note.getId())
+            .put("paragraphId", angularObject.getParagraphId()));
+  }
 
-      List<String> settingIds =
-          getNotebook().getInterpreterSettingManager().getSettingIds();
-      for (String id : settingIds) {
-        if (interpreterGroupId.contains(id)) {
-          getConnectionManager().broadcast(note.getId(),
-              new Message(OP.ANGULAR_OBJECT_REMOVE).put("name", name).put("noteId", noteId)
-                  .put("paragraphId", paragraphId));
-          break;
+  @Override
+  public void onRemoveAngularObject(String interpreterGroupId, AngularObject angularObject) {
+    // not global scope, so we just need to load the corresponded note.
+    if (angularObject.getNoteId() != null) {
+      try {
+        Note note = getNotebook().getNote(angularObject.getNoteId());
+        removeNoteAngularObject(angularObject.getNoteId(), angularObject, interpreterGroupId);
+      } catch (IOException e) {
+        LOG.error("AngularObject's note: {} is not found", angularObject.getNoteId());
+      }
+    } else {
+      // global scope angular object needs to load and iterate all notes, this is inefficient.
+      getNotebook().getNoteStream().forEach(note -> {
+        if (angularObject.getNoteId() != null && !note.getId().equals(angularObject.getNoteId())) {
+          return;
         }
+        removeNoteAngularObject(note.getId(), angularObject, interpreterGroupId);
+      });
+    }
+  }
+
+  private void removeNoteAngularObject(String noteId, AngularObject angularObject, String interpreterGroupId) {
+    List<String> settingIds =
+            getNotebook().getInterpreterSettingManager().getSettingIds();
+    for (String id : settingIds) {
+      if (interpreterGroupId.contains(id)) {
+        getConnectionManager().broadcast(noteId,
+                new Message(OP.ANGULAR_OBJECT_REMOVE)
+                        .put("name", angularObject.getName())
+                        .put("noteId", angularObject.getNoteId())
+                        .put("paragraphId", angularObject.getParagraphId()));
+        break;
       }
     }
   }

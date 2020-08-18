@@ -29,7 +29,6 @@ import org.json.JSONObject;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.time.Duration;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -39,23 +38,32 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class JobManager {
 
   private static Logger LOGGER = LoggerFactory.getLogger(JobManager.class);
+  public static final String LATEST_CHECKPOINT_PATH = "latest_checkpoint_path";
+  public static final String SAVEPOINT_PATH = "savepoint_path";
+  public static final String RESUME_FROM_SAVEPOINT = "resumeFromSavepoint";
+  public static final String RESUME_FROM_CHECKPOINT = "resumeFromLatestCheckpoint";
+  public static final String SAVEPOINT_DIR = "savepointDir";
+
 
   private Map<String, JobClient> jobs = new HashMap<>();
   private ConcurrentHashMap<JobID, FlinkJobProgressPoller> jobProgressPollerMap =
           new ConcurrentHashMap<>();
   private FlinkZeppelinContext z;
-  private String flinkWebUI;
+  private String flinkWebUrl;
+  private String replacedFlinkWebUrl;
 
   public JobManager(FlinkZeppelinContext z,
-                    String flinkWebUI) {
+                    String flinkWebUrl,
+                    String replacedFlinkWebUrl) {
     this.z = z;
-    this.flinkWebUI = flinkWebUI;
+    this.flinkWebUrl = flinkWebUrl;
+    this.replacedFlinkWebUrl = replacedFlinkWebUrl;
   }
 
   public void addJob(InterpreterContext context, JobClient jobClient) {
     String paragraphId = context.getParagraphId();
     JobClient previousJobClient = this.jobs.put(paragraphId, jobClient);
-    FlinkJobProgressPoller thread = new FlinkJobProgressPoller(flinkWebUI, jobClient.getJobID(), context);
+    FlinkJobProgressPoller thread = new FlinkJobProgressPoller(flinkWebUrl, jobClient.getJobID(), context);
     thread.setName("JobProgressPoller-Thread-" + paragraphId);
     thread.start();
     this.jobProgressPollerMap.put(jobClient.getJobID(), thread);
@@ -82,7 +90,12 @@ public class JobManager {
   public void sendFlinkJobUrl(InterpreterContext context) {
     JobClient jobClient = jobs.get(context.getParagraphId());
     if (jobClient != null) {
-      String jobUrl = flinkWebUI + "#/job/" + jobClient.getJobID();
+      String jobUrl = null;
+      if (replacedFlinkWebUrl != null) {
+        jobUrl = replacedFlinkWebUrl + "#/job/" + jobClient.getJobID();
+      } else {
+        jobUrl = flinkWebUrl + "#/job/" + jobClient.getJobID();
+      }
       Map<String, String> infos = new HashMap<>();
       infos.put("jobUrl", jobUrl);
       infos.put("label", "FLINK JOB");
@@ -122,15 +135,18 @@ public class JobManager {
 
     boolean cancelled = false;
     try {
-      String savepointDir = context.getLocalProperties().get("savepointDir");
-      if (StringUtils.isBlank(savepointDir)) {
+      String savePointDir = context.getLocalProperties().get(SAVEPOINT_DIR);
+      if (StringUtils.isBlank(savePointDir)) {
         LOGGER.info("Trying to cancel job of paragraph {}", context.getParagraphId());
         jobClient.cancel();
       } else {
         LOGGER.info("Trying to stop job of paragraph {} with save point dir: {}",
-                context.getParagraphId(), savepointDir);
-        String savePointPath = jobClient.stopWithSavepoint(true, savepointDir).get();
-        z.angularBind(context.getParagraphId() + "_savepointpath", savePointPath);
+                context.getParagraphId(), savePointDir);
+        String savePointPath = jobClient.stopWithSavepoint(true, savePointDir).get();
+        Map<String, String> config = new HashMap<>();
+        config.put(SAVEPOINT_PATH, savePointPath);
+        context.getIntpEventClient().updateParagraphConfig(
+                context.getNoteId(), context.getParagraphId(), config);
         LOGGER.info("Job {} of paragraph {} is stopped with save point path: {}",
                 jobClient.getJobID(), context.getParagraphId(), savePointPath);
       }
@@ -162,7 +178,7 @@ public class JobManager {
 
   class FlinkJobProgressPoller extends Thread {
 
-    private String flinkWebUI;
+    private String flinkWebUrl;
     private JobID jobId;
     private InterpreterContext context;
     private boolean isStreamingInsertInto;
@@ -170,8 +186,8 @@ public class JobManager {
     private AtomicBoolean running = new AtomicBoolean(true);
     private boolean isFirstPoll = true;
 
-    FlinkJobProgressPoller(String flinkWebUI, JobID jobId, InterpreterContext context) {
-      this.flinkWebUI = flinkWebUI;
+    FlinkJobProgressPoller(String flinkWebUrl, JobID jobId, InterpreterContext context) {
+      this.flinkWebUrl = flinkWebUrl;
       this.jobId = jobId;
       this.context = context;
       this.isStreamingInsertInto = context.getLocalProperties().containsKey("flink.streaming.insert_into");
@@ -186,7 +202,7 @@ public class JobManager {
           synchronized (running) {
             running.wait(1000);
           }
-          rootNode = Unirest.get(flinkWebUI + "/jobs/" + jobId.toString())
+          rootNode = Unirest.get(flinkWebUrl + "/jobs/" + jobId.toString())
                   .asJson().getBody();
           JSONArray vertices = rootNode.getObject().getJSONArray("vertices");
           int totalTasks = 0;
@@ -223,8 +239,28 @@ public class JobManager {
                     context.getNoteId(),
                     context.getParagraphId());
           }
+
+          // fetch checkpoints info and save the latest checkpoint into paragraph's config.
+          rootNode = Unirest.get(flinkWebUrl + "/jobs/" + jobId.toString() + "/checkpoints")
+                  .asJson().getBody();
+          if (rootNode.getObject().has("latest")) {
+            JSONObject latestObject = rootNode.getObject().getJSONObject("latest");
+            if (latestObject.has("completed") && latestObject.get("completed") instanceof JSONObject) {
+              JSONObject completedObject = latestObject.getJSONObject("completed");
+              if (completedObject.has("external_path")) {
+                String checkpointPath = completedObject.getString("external_path");
+                LOGGER.debug("Latest checkpoint path: {}", checkpointPath);
+                if (!StringUtils.isBlank(checkpointPath)) {
+                  Map<String, String> config = new HashMap<>();
+                  config.put(LATEST_CHECKPOINT_PATH, checkpointPath);
+                  context.getIntpEventClient().updateParagraphConfig(
+                          context.getNoteId(), context.getParagraphId(), config);
+                }
+              }
+            }
+          }
         } catch (Exception e) {
-          LOGGER.error("Fail to poll flink job progress via rest api, rest api: " + rootNode, e);
+          LOGGER.error("Fail to poll flink job progress via rest api", e);
         }
       }
     }
