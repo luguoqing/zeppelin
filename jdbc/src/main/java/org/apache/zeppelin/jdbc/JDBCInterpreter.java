@@ -427,6 +427,7 @@ public class JDBCInterpreter extends KerberosInterpreter {
     boolean testWhileIdle = "true".equalsIgnoreCase(properties.getProperty("testWhileIdle"));
     long timeBetweenEvictionRunsMillis = PropertiesUtil.getLong(
         properties, "timeBetweenEvictionRunsMillis", -1L);
+
     long maxWaitMillis = PropertiesUtil.getLong(properties, "maxWaitMillis", -1L);
     int maxIdle = PropertiesUtil.getInt(properties, "maxIdle", 8);
     int minIdle = PropertiesUtil.getInt(properties, "minIdle", 0);
@@ -746,8 +747,8 @@ public class JDBCInterpreter extends KerberosInterpreter {
           }
 
           // start hive monitor thread if it is hive jdbc
-          if (getJDBCConfiguration(user).getPropertyMap(dbPrefix).getProperty(URL_KEY)
-                  .startsWith("jdbc:hive2://")) {
+          String jdbcURL = getJDBCConfiguration(user).getPropertyMap(dbPrefix).getProperty(URL_KEY);
+          if (jdbcURL != null && jdbcURL.startsWith("jdbc:hive2://")) {
             HiveUtils.startHiveMonitorThread(statement, context,
                     Boolean.parseBoolean(getProperty("hive.log.display", "true")));
           }

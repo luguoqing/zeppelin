@@ -24,7 +24,6 @@ import org.apache.commons.lang3.StringUtils;
 import org.apache.thrift.TException;
 import org.apache.thrift.server.TThreadPoolServer;
 import org.apache.thrift.transport.TServerSocket;
-import org.apache.thrift.transport.TTransportException;
 import org.apache.zeppelin.cluster.ClusterManagerClient;
 import org.apache.zeppelin.cluster.meta.ClusterMeta;
 import org.apache.zeppelin.conf.ZeppelinConfiguration;
@@ -65,6 +64,7 @@ import org.apache.zeppelin.resource.DistributedResourcePool;
 import org.apache.zeppelin.resource.Resource;
 import org.apache.zeppelin.resource.ResourcePool;
 import org.apache.zeppelin.resource.ResourceSet;
+import org.apache.zeppelin.scheduler.ExecutorFactory;
 import org.apache.zeppelin.scheduler.Job;
 import org.apache.zeppelin.scheduler.Job.Status;
 import org.apache.zeppelin.scheduler.JobListener;
@@ -146,8 +146,8 @@ public class RemoteInterpreterServer extends Thread
 
   private boolean isTest;
 
+  private ZeppelinConfiguration zConf;
   // cluster manager client
-  private ZeppelinConfiguration zConf = ZeppelinConfiguration.create();
   private ClusterManagerClient clusterManagerClient;
 
   public RemoteInterpreterServer(String intpEventServerHost,
@@ -162,12 +162,13 @@ public class RemoteInterpreterServer extends Thread
                                  String portRange,
                                  String interpreterGroupId,
                                  boolean isTest) throws Exception {
-    LOGGER.info("Starting remote interpreter server on port {}, intpEventServerAddress: {}:{}", port,
-            intpEventServerHost, intpEventServerPort);
+    super("RemoteInterpreterServer-Thread");
     if (null != intpEventServerHost) {
       this.intpEventServerHost = intpEventServerHost;
       this.intpEventServerPort = intpEventServerPort;
       if (!isTest) {
+        LOGGER.info("Starting remote interpreter server on port {}, intpEventServerAddress: {}:{}", port,
+          intpEventServerHost, intpEventServerPort);
         intpEventClient = new RemoteInterpreterEventClient(intpEventServerHost, intpEventServerPort);
       }
     } else {
@@ -192,12 +193,6 @@ public class RemoteInterpreterServer extends Thread
         new TThreadPoolServer.Args(serverTransport).processor(processor));
     remoteWorksResponsePool = Collections.synchronizedMap(new HashMap<String, Object>());
 
-    if (zConf.isClusterMode()) {
-      clusterManagerClient = ClusterManagerClient.getInstance(zConf);
-      clusterManagerClient.start(interpreterGroupId);
-    }
-
-    lifecycleManager = createLifecycleManager();
   }
 
   @Override
@@ -215,28 +210,18 @@ public class RemoteInterpreterServer extends Thread
               interrupted = true;
             }
           }
-
-          if (zConf.isClusterMode()) {
-            // Cluster mode, discovering interpreter processes through metadata registration
-            // TODO (Xun): Unified use of cluster metadata for process discovery of all operating modes
-            // 1. Can optimize the startup logic of the process
-            // 2. Can solve the problem that running the interpreter's IP in docker may be a virtual IP
-            putClusterMeta();
-          } else {
-            if (!interrupted) {
-              RegisterInfo registerInfo = new RegisterInfo(host, port, interpreterGroupId);
+          if (!interrupted) {
+            RegisterInfo registerInfo = new RegisterInfo(host, port, interpreterGroupId);
+            try {
+              LOGGER.info("Registering interpreter process");
+              intpEventClient.registerInterpreterProcess(registerInfo);
+              LOGGER.info("Registered interpreter process");
+            } catch (Exception e) {
+              LOGGER.error("Error while registering interpreter: {}, cause: {}", registerInfo, e);
               try {
-                LOGGER.info("Registering interpreter process");
-                intpEventClient.registerInterpreterProcess(registerInfo);
-                LOGGER.info("Registered interpreter process");
-                lifecycleManager.onInterpreterProcessStarted(interpreterGroupId);
-              } catch (Exception e) {
-                LOGGER.error("Error while registering interpreter: {}", registerInfo, e);
-                try {
-                  shutdown();
-                } catch (TException e1) {
-                  LOGGER.warn("Exception occurs while shutting down", e1);
-                }
+                shutdown();
+              } catch (TException e1) {
+                LOGGER.warn("Exception occurs while shutting down", e1);
               }
             }
           }
@@ -244,18 +229,9 @@ public class RemoteInterpreterServer extends Thread
           if (launcherEnv != null && "yarn".endsWith(launcherEnv)) {
             try {
               YarnUtils.register(host, port);
-              Thread thread = new Thread(() -> {
-                while(!Thread.interrupted() && server.isServing()) {
-                  YarnUtils.heartbeat();
-                  try {
-                    Thread.sleep(60 * 1000);
-                  } catch (InterruptedException e) {
-                    LOGGER.warn(e.getMessage(), e);
-                  }
-                }
-              });
-              thread.setName("RM-Heartbeat-Thread");
-              thread.start();
+              ScheduledExecutorService yarnHeartbeat = ExecutorFactory.singleton()
+                .createOrGetScheduled("RM-Heartbeat", 1);
+              yarnHeartbeat.scheduleAtFixedRate(YarnUtils::heartbeat, 0, 1, TimeUnit.MINUTES);
             } catch (Exception e) {
               LOGGER.error("Fail to register yarn app", e);
             }
@@ -264,6 +240,32 @@ public class RemoteInterpreterServer extends Thread
       }).start();
     }
     server.serve();
+  }
+
+  @Override
+  public void init(Map<String, String> properties) throws TException {
+    this.zConf = ZeppelinConfiguration.create();
+    for (Map.Entry<String, String> entry : properties.entrySet()) {
+      this.zConf.setProperty(entry.getKey(), entry.getValue());
+    }
+
+    if (zConf.isClusterMode()) {
+      clusterManagerClient = ClusterManagerClient.getInstance(zConf);
+      clusterManagerClient.start(interpreterGroupId);
+
+      // Cluster mode, discovering interpreter processes through metadata registration
+      // TODO (Xun): Unified use of cluster metadata for process discovery of all operating modes
+      // 1. Can optimize the startup logic of the process
+      // 2. Can solve the problem that running the interpreter's IP in docker may be a virtual IP
+      putClusterMeta();
+    }
+
+    try {
+      lifecycleManager = createLifecycleManager();
+      lifecycleManager.onInterpreterProcessStarted(interpreterGroupId);
+    } catch (Exception e) {
+      throw new TException("Fail to create LifeCycleManager", e);
+    }
   }
 
   @Override
@@ -302,6 +304,7 @@ public class RemoteInterpreterServer extends Thread
       }
       if (!isTest) {
         SchedulerFactory.singleton().destroy();
+        ExecutorFactory.singleton().shutdownAll();
       }
 
       if ("yarn".equals(launcherEnv)) {
@@ -339,6 +342,14 @@ public class RemoteInterpreterServer extends Thread
     shutDownThread.start();
   }
 
+  public ZeppelinConfiguration getConf() {
+    return this.zConf;
+  }
+
+  public LifecycleManager getLifecycleManager() {
+    return this.lifecycleManager;
+  }
+
   public int getPort() {
     return port;
   }
@@ -353,8 +364,8 @@ public class RemoteInterpreterServer extends Thread
 
   private LifecycleManager createLifecycleManager() throws Exception {
     String lifecycleManagerClass = zConf.getLifecycleManagerClass();
-    Class clazz = Class.forName(lifecycleManagerClass);
-    LOGGER.info("Creating interpreter lifecycle manager: " + lifecycleManagerClass);
+    Class<?> clazz = Class.forName(lifecycleManagerClass);
+    LOGGER.info("Creating interpreter lifecycle manager: {}", lifecycleManagerClass);
     return (LifecycleManager) clazz.getConstructor(ZeppelinConfiguration.class, RemoteInterpreterServer.class)
             .newInstance(zConf, this);
   }
