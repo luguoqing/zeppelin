@@ -20,6 +20,7 @@ import org.apache.commons.lang3.StringUtils;
 import org.apache.hive.common.util.HiveVersionInfo;
 import org.apache.hive.jdbc.HiveStatement;
 import org.apache.zeppelin.interpreter.InterpreterContext;
+import org.apache.zeppelin.jdbc.JDBCInterpreter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -53,7 +54,8 @@ public class HiveUtils {
    */
   public static void startHiveMonitorThread(Statement stmt,
                                             InterpreterContext context,
-                                            boolean displayLog) {
+                                            boolean displayLog,
+                                            JDBCInterpreter jdbcInterpreter) {
     HiveStatement hiveStmt = (HiveStatement)
             ((DelegatingStatement) ((DelegatingStatement) stmt).getDelegate()).getDelegate();
     String hiveVersion = HiveVersionInfo.getVersion();
@@ -66,8 +68,11 @@ public class HiveUtils {
     }
     // need to use final variable progressBar in thread, so need progressBarTemp here.
     final ProgressBar progressBar = progressBarTemp;
-
+    final long timeoutThreshold = Long.parseLong(
+            jdbcInterpreter.getProperty("zeppelin.jdbc.hive.timeout.threshold", "" + 60 * 1000));
     Thread thread = new Thread(() -> {
+      boolean jobLaunched = false;
+      long jobLastActiveTime = System.currentTimeMillis();
       while (hiveStmt.hasMoreLogs() && !Thread.interrupted()) {
         try {
           List<String> logs = hiveStmt.getQueryLog();
@@ -81,7 +86,7 @@ public class HiveUtils {
           if (!StringUtils.isBlank(logsOutput) && progressBar != null && displayLogProperty) {
             progressBar.operationLogShowedToUser();
           }
-          Optional<String> jobURL = extractJobURL(logsOutput);
+          Optional<String> jobURL = extractMRJobURL(logsOutput);
           if (jobURL.isPresent()) {
             Map<String, String> infos = new HashMap<>();
             infos.put("jobUrl", jobURL.get());
@@ -91,18 +96,36 @@ public class HiveUtils {
             infos.put("paraId", context.getParagraphId());
             context.getIntpEventClient().onParaInfosReceived(infos);
           }
+          if (logsOutput.contains("Launching Job")) {
+            jobLaunched = true;
+          }
+
+          if (jobLaunched) {
+            if (StringUtils.isNotBlank(logsOutput)) {
+              jobLastActiveTime = System.currentTimeMillis();
+            } else {
+              if (((System.currentTimeMillis() - jobLastActiveTime) > timeoutThreshold)) {
+                String errorMessage = "Cancel this job as no more log is produced in the " +
+                        "last " + timeoutThreshold / 1000 + " seconds, " +
+                        "maybe it is because no yarn resources";
+                LOGGER.warn(errorMessage);
+                jdbcInterpreter.cancel(context, errorMessage);
+                break;
+              }
+            }
+          }
           // refresh logs every 1 second.
           Thread.sleep(DEFAULT_QUERY_PROGRESS_INTERVAL);
         } catch (Exception e) {
           LOGGER.warn("Fail to write output", e);
         }
       }
-      LOGGER.debug("Hive monitor thread is finished");
+      LOGGER.info("HiveMonitor-Thread is finished");
     });
     thread.setName("HiveMonitor-Thread");
     thread.setDaemon(true);
     thread.start();
-    LOGGER.info("Start HiveMonitor-Thread for sql: " + stmt);
+    LOGGER.info("Start HiveMonitor-Thread for sql: " + hiveStmt);
 
     if (progressBar != null) {
       hiveStmt.setInPlaceUpdateStream(progressBar.getInPlaceUpdateStream(context.out));
@@ -118,7 +141,7 @@ public class HiveUtils {
   }
 
   // extract hive job url from logs, it only works for MR engine.
-  static Optional<String> extractJobURL(String log) {
+  static Optional<String> extractMRJobURL(String log) {
     Matcher matcher = JOBURL_PATTERN.matcher(log);
     if (matcher.matches()) {
       String jobURL = matcher.group(1);
