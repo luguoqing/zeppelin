@@ -780,6 +780,7 @@ public class NotebookServer extends WebSocketServlet
 
   public void broadcastReloadedNoteList(NotebookSocket conn, ServiceContext context)
       throws IOException {
+    getNotebook().reloadAllNotes(context.getAutheInfo());
     broadcastNoteListUpdate();
   }
 
@@ -1684,7 +1685,7 @@ public class NotebookServer extends WebSocketServlet
     try {
       Note note = getNotebook().getNote(noteId);
       if (note == null) {
-        LOG.warn("Note " + noteId + " note found");
+        LOG.warn("Note {} not found", noteId);
         return;
       }
       Paragraph paragraph = note.getParagraph(paragraphId);
